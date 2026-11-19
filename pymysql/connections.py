@@ -66,6 +66,16 @@ DEFAULT_CHARSET = "utf8mb4"
 
 MAX_PACKET_LEN = 2**24 - 1
 
+#: Headroom kept below ``max_allowed_packet`` so the command byte, packet
+#: headers and small server-side differences never push a statement over
+#: the limit.
+PACKET_SAFETY_MARGIN = 1024
+
+#: Values of :attr:`Connection._command_phase` while a command is in flight.
+_PHASE_IDLE = "idle"
+_PHASE_SENDING = "sending"
+_PHASE_READING = "reading"
+
 
 def _pack_int24(n):
     return struct.pack("<I", n)[:3]
@@ -360,6 +370,18 @@ class Connection:
         self.sql_mode = sql_mode
         self.init_command = init_command
         self.max_allowed_packet = max_allowed_packet
+        # Server-side value of max_allowed_packet, discovered lazily via
+        # SELECT @@max_allowed_packet. None until discovered; False while the
+        # lookup is in progress (guards against recursion).
+        self._server_max_allowed_packet = None
+        # Tracks how far the current command got so _force_close() can tell
+        # whether an open transaction was definitely rolled back.
+        self._command_phase = _PHASE_IDLE
+        self._last_command = None
+        # Outcome of the in-flight transaction when the connection is lost.
+        # One of err.TRANSACTION_* constants, or None while the connection is
+        # healthy.
+        self.last_transaction_state = None
         self._auth_plugin_map = auth_plugin_map or {}
         self.server_public_key = server_public_key
 
@@ -452,6 +474,9 @@ class Connection:
 
     def _force_close(self):
         """Close connection without QUIT message."""
+        if self._sock is not None:
+            self.last_transaction_state = self._infer_transaction_state()
+            self._command_phase = _PHASE_IDLE
         if self._rfile:
             self._rfile.close()
         if self._sock:
@@ -461,6 +486,34 @@ class Connection:
                 pass
         self._sock = None
         self._rfile = None
+
+    def _infer_transaction_state(self):
+        """Best-effort outcome of the current transaction on disconnect.
+
+        The server rolls back any open explicit transaction when a connection
+        dies, so a lost connection while ``SERVER_STATUS_IN_TRANS`` was set
+        means the changes were not durable -- unless the lost command itself
+        was the ``COMMIT`` and we never got its acknowledgement, in which case
+        the result is genuinely unknowable.
+        """
+        if self._last_command == "COMMIT":
+            return err.TRANSACTION_UNKNOWN
+        in_transaction = bool(self.server_status & SERVER_STATUS.SERVER_STATUS_IN_TRANS)
+        if in_transaction:
+            return err.TRANSACTION_ROLLED_BACK
+        if self._command_phase == _PHASE_SENDING:
+            # The statement may never have reached the server, but in
+            # autocommit mode it could also have been applied just before the
+            # socket died. We cannot tell from the client side.
+            return err.TRANSACTION_UNKNOWN
+        # Autocommit statement the server finished processing: its effects are
+        # durable even though the reply (or the next command) failed.
+        return err.TRANSACTION_COMMITTED
+
+    def _annotate_connection_error(self, error):
+        """Attach the inferred transaction state to a disconnect error."""
+        error.transaction_state = self.last_transaction_state
+        return error
 
     __del__ = _force_close
 
@@ -493,8 +546,10 @@ class Connection:
 
     def begin(self):
         """Begin transaction."""
+        self._last_command = "BEGIN"
         self._execute_command(COMMAND.COM_QUERY, "BEGIN")
         self._read_ok_packet()
+        self._command_phase = _PHASE_IDLE
 
     def commit(self):
         """
@@ -503,8 +558,11 @@ class Connection:
         See `Connection.commit() <https://www.python.org/dev/peps/pep-0249/#commit>`_
         in the specification.
         """
+        self._last_command = "COMMIT"
         self._execute_command(COMMAND.COM_QUERY, "COMMIT")
         self._read_ok_packet()
+        self._command_phase = _PHASE_IDLE
+        self.last_transaction_state = None
 
     def rollback(self):
         """
@@ -513,8 +571,11 @@ class Connection:
         See `Connection.rollback() <https://www.python.org/dev/peps/pep-0249/#rollback>`_
         in the specification.
         """
+        self._last_command = "ROLLBACK"
         self._execute_command(COMMAND.COM_QUERY, "ROLLBACK")
         self._read_ok_packet()
+        self._command_phase = _PHASE_IDLE
+        self.last_transaction_state = None
 
     def show_warnings(self):
         """Send the "SHOW WARNINGS" SQL command."""
@@ -581,15 +642,91 @@ class Connection:
             return cursor(self)
         return self.cursorclass(self)
 
+    def get_server_max_allowed_packet(self):
+        """Return the server-side ``max_allowed_packet`` in bytes.
+
+        The value is fetched with ``SELECT @@max_allowed_packet`` on first use
+        and cached for the life of the connection. If the lookup fails (for
+        example the connection is already broken), the client-side
+        :attr:`max_allowed_packet` setting is used instead.
+        """
+        if self._server_max_allowed_packet is not None:
+            return self._server_max_allowed_packet
+        if self._server_max_allowed_packet is False:
+            # Called from inside the lookup query itself.
+            return self.max_allowed_packet
+        self._server_max_allowed_packet = False
+        try:
+            cursor = self.cursor()
+            cursor.execute("SELECT @@max_allowed_packet")
+            value = int(cursor.fetchone()[0])
+            cursor.close()
+        except Exception:
+            value = self.max_allowed_packet
+        self._server_max_allowed_packet = value
+        return value
+
+    @property
+    def effective_max_allowed_packet(self):
+        """Effective statement size limit in bytes.
+
+        This is the smaller of the client-side :attr:`max_allowed_packet`
+        parameter and the server-side ``max_allowed_packet`` variable, minus a
+        small safety margin for the command byte and protocol headers.
+        """
+        limit = min(
+            self.max_allowed_packet,
+            self.get_server_max_allowed_packet(),
+        )
+        return max(0, limit - PACKET_SAFETY_MARGIN)
+
+    def _check_packet_size(self, payload_length):
+        """Raise before sending if *payload_length* cannot fit in one command.
+
+        Raising here -- rather than letting the server reject or drop the
+        connection -- keeps the connection usable and gives the caller a
+        specific exception to split the work on.
+        """
+        limit = self.effective_max_allowed_packet
+        if payload_length > limit:
+            raise err.PacketTooLargeError(
+                CR.CR_NET_PACKET_TOO_LARGE,
+                f"Statement of {payload_length} bytes exceeds the effective "
+                f"max_allowed_packet of {limit} bytes. Split the statement "
+                "into smaller batches (e.g. Cursor.executemany) instead of "
+                "sending it in one command.",
+            )
+
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
         # if DEBUG:
         #     print("DEBUG: sending query:", sql)
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
+        self._last_command = self._classify_query(sql)
         self._execute_command(COMMAND.COM_QUERY, sql)
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+        self._command_phase = _PHASE_IDLE
+        self.last_transaction_state = None
         return self._affected_rows
+
+    @staticmethod
+    def _classify_query(sql):
+        """Return ``"COMMIT"`` / ``"ROLLBACK"`` for bare transaction control
+        statements, otherwise ``None``. Only the first keyword matters;
+        comments and leading whitespace are skipped."""
+        head = sql.lstrip()
+        # Strip a leading /* ... */ comment if present.
+        if head[:2] == b"/*":
+            end = head.find(b"*/")
+            if end != -1:
+                head = head[end + 2 :].lstrip()
+        head = head[:16].upper()
+        if head.startswith(b"COMMIT"):
+            return "COMMIT"
+        if head.startswith(b"ROLLBACK"):
+            return "ROLLBACK"
+        return None
 
     def next_result(self, unbuffered=False):
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
@@ -672,6 +809,10 @@ class Connection:
 
     def connect(self, sock=None):
         self._closed = False
+        self._command_phase = _PHASE_IDLE
+        self._last_command = None
+        self.last_transaction_state = None
+        self._server_max_allowed_packet = None
         try:
             if sock is None:
                 if self.unix_socket:
@@ -795,9 +936,11 @@ class Connection:
                 self._force_close()
                 if packet_number == 0:
                     # MariaDB sends error packet with seqno==0 when shutdown
-                    raise err.OperationalError(
-                        CR.CR_SERVER_LOST,
-                        "Lost connection to MySQL server during query",
+                    raise self._annotate_connection_error(
+                        err.OperationalError(
+                            CR.CR_SERVER_LOST,
+                            "Lost connection to MySQL server during query",
+                        )
                     )
                 raise err.InternalError(
                     "Packet sequence number wrong - got %d expected %d"
@@ -813,6 +956,10 @@ class Connection:
             if bytes_to_read < MAX_PACKET_LEN:
                 break
 
+        # The complete reply arrived, so the command is no longer in flight.
+        # A disconnect inside the loop above already went through
+        # _force_close(), which captured the phase before this reset.
+        self._command_phase = _PHASE_IDLE
         packet = packet_type(b"".join(buff), self.encoding)
         if packet.is_error_packet():
             if self._result is not None and self._result.unbuffered_active is True:
@@ -831,9 +978,11 @@ class Connection:
                 if e.errno == errno.EINTR:
                     continue
                 self._force_close()
-                raise err.OperationalError(
-                    CR.CR_SERVER_LOST,
-                    f"Lost connection to MySQL server during query ({e})",
+                raise self._annotate_connection_error(
+                    err.OperationalError(
+                        CR.CR_SERVER_LOST,
+                        f"Lost connection to MySQL server during query ({e})",
+                    )
                 )
             except BaseException:
                 # Don't convert unknown exception to MySQLError.
@@ -841,8 +990,10 @@ class Connection:
                 raise
         if len(data) < num_bytes:
             self._force_close()
-            raise err.OperationalError(
-                CR.CR_SERVER_LOST, "Lost connection to MySQL server during query"
+            raise self._annotate_connection_error(
+                err.OperationalError(
+                    CR.CR_SERVER_LOST, "Lost connection to MySQL server during query"
+                )
             )
         return data
 
@@ -854,8 +1005,10 @@ class Connection:
             self._sock.sendall(data)
         except OSError as e:
             self._force_close()
-            raise err.OperationalError(
-                CR.CR_SERVER_GONE_ERROR, f"MySQL server has gone away ({e!r})"
+            raise self._annotate_connection_error(
+                err.OperationalError(
+                    CR.CR_SERVER_GONE_ERROR, f"MySQL server has gone away ({e!r})"
+                )
             )
 
     def _read_query_result(self, unbuffered=False):
@@ -897,6 +1050,14 @@ class Connection:
         if isinstance(sql, str):
             sql = sql.encode(self.encoding)
 
+        # Reject statements larger than the effective max_allowed_packet
+        # before writing anything. The +1 accounts for the command byte.
+        # Sending an oversize command makes the server reject or drop the
+        # connection, leaving the transaction outcome unknowable.
+        self._check_packet_size(len(sql) + 1)
+
+        self._command_phase = _PHASE_SENDING
+
         packet_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
 
         # tiny optimization: build first packet manually instead of
@@ -909,6 +1070,7 @@ class Connection:
         self._next_seq_id = 1
 
         if packet_size < MAX_PACKET_LEN:
+            self._command_phase = _PHASE_READING
             return
 
         sql = sql[packet_size - 1 :]
@@ -918,6 +1080,7 @@ class Connection:
             sql = sql[packet_size:]
             if not sql and packet_size < MAX_PACKET_LEN:
                 break
+        self._command_phase = _PHASE_READING
 
     def _request_authentication(self):
         # https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse

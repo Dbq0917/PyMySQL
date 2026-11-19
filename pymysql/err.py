@@ -45,6 +45,17 @@ class OperationalError(DatabaseError):
     error occurred during processing, etc."""
 
 
+class PacketTooLargeError(OperationalError):
+    """Exception raised when a statement is larger than the effective
+    ``max_allowed_packet`` limit *before* anything is sent to the server.
+
+    Unlike an oversize packet rejected by the server itself, raising this
+    error leaves the connection usable, so callers can split the statement
+    (for example with :meth:`Cursor.executemany`) and retry without
+    reconnecting or guessing whether anything was committed.
+    """
+
+
 class IntegrityError(DatabaseError):
     """Exception raised when the relational integrity of the database
     is affected, e.g. a foreign key check fails, duplicate key,
@@ -136,6 +147,24 @@ _map_error(
 
 
 del _map_error, ER
+
+
+#: The last statement completed successfully and its changes are durable
+#: according to the transaction mode that was active (autocommit or an
+#: explicit ``COMMIT`` acknowledged by the server).
+TRANSACTION_COMMITTED = "committed"
+
+#: The connection died while an explicit transaction was open. The server
+#: rolls back such a transaction on disconnect, so none of its changes are
+#: durable and replaying the whole transaction is safe.
+TRANSACTION_ROLLED_BACK = "rolled_back"
+
+#: The connection died at a point where the outcome cannot be determined
+#: (typically while sending a statement or waiting for the reply to a
+#: ``COMMIT``). The statement may or may not have reached the server, so a
+#: blind retry could create duplicates; idempotency keys or manual checks
+#: are required before retrying.
+TRANSACTION_UNKNOWN = "unknown"
 
 
 def raise_mysql_exception(data):

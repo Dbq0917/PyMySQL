@@ -1,3 +1,4 @@
+import contextlib
 import re
 import warnings
 
@@ -34,8 +35,10 @@ class Cursor:
 
     #: Max statement size which :meth:`executemany` generates.
     #:
-    #: Max size of allowed statement is max_allowed_packet - packet_header_size.
-    #: Default value of max_allowed_packet is 1048576.
+    #: Default cap used when the connection cannot report a server-side
+    #: ``max_allowed_packet``. When the connection knows the real limit,
+    #: :meth:`executemany` chunks against that instead, so batches stay as
+    #: large as the server accepts instead of being capped at one megabyte.
     max_stmt_length = 1024000
 
     def __init__(self, connection):
@@ -73,6 +76,15 @@ class Cursor:
         if not self.connection:
             raise err.ProgrammingError("Cursor closed")
         return self.connection
+
+    def _get_max_stmt_length(self):
+        """Statement size cap for bulk inserts, derived from the effective
+        connection ``max_allowed_packet`` when available."""
+        conn = self.connection
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                return conn.effective_max_allowed_packet
+        return self.max_stmt_length
 
     def _check_executed(self):
         if not self._executed:
@@ -201,7 +213,7 @@ class Cursor:
                 q_values,
                 q_postfix,
                 args,
-                self.max_stmt_length,
+                self._get_max_stmt_length(),
                 self._get_db().encoding,
             )
 

@@ -26,6 +26,9 @@ import sys
 
 from .constants import FIELD_TYPE
 from .err import (
+    TRANSACTION_COMMITTED,
+    TRANSACTION_ROLLED_BACK,
+    TRANSACTION_UNKNOWN,
     DatabaseError,
     DataError,
     Error,
@@ -35,6 +38,7 @@ from .err import (
     MySQLError,
     NotSupportedError,
     OperationalError,
+    PacketTooLargeError,
     ProgrammingError,
     Warning,
 )
@@ -147,6 +151,9 @@ __all__ = [
     "STRING",
     "TIME",
     "TIMESTAMP",
+    "TRANSACTION_COMMITTED",
+    "TRANSACTION_ROLLED_BACK",
+    "TRANSACTION_UNKNOWN",
     "Binary",
     "Connect",
     "Connection",
@@ -162,6 +169,7 @@ __all__ = [
     "MySQLError",
     "NotSupportedError",
     "OperationalError",
+    "PacketTooLargeError",
     "ProgrammingError",
     "Time",
     "TimeFromTicks",

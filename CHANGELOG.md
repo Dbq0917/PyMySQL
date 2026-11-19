@@ -1,5 +1,19 @@
 # Changes
 
+## Unreleased
+
+* Learn the server-side `max_allowed_packet` and reject oversize statements
+  with `pymysql.err.PacketTooLargeError` before anything is sent, instead of
+  letting the server drop the connection and leaving the transaction outcome
+  unknown.
+* `Cursor.executemany()` now chunks bulk inserts against the effective server
+  packet limit rather than a fixed one-megabyte cap.
+* Disconnect errors (`OperationalError` 2006/2013) now carry a
+  `transaction_state` attribute (`committed`, `rolled_back`, or `unknown`) so
+  callers can tell whether an open transaction was discarded by the server.
+* Add `pymysql.retry.run_in_transaction()` for replaying idempotent units of
+  work on a fresh connection after a rollback disconnect.
+
 ## v1.2.4 (security fix)
 
 Release date: 2026-11-09

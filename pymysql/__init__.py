@@ -77,6 +77,7 @@ apilevel = "2.0"
 paramstyle = "pyformat"
 
 from . import connections
+from .pool import ConnectionPool, PoolClosedError, PoolTimeoutError
 
 
 class DBAPISet(frozenset):
@@ -150,6 +151,7 @@ __all__ = [
     "Binary",
     "Connect",
     "Connection",
+    "ConnectionPool",
     "DBAPISet",
     "DataError",
     "DatabaseError",
@@ -162,6 +164,8 @@ __all__ = [
     "MySQLError",
     "NotSupportedError",
     "OperationalError",
+    "PoolClosedError",
+    "PoolTimeoutError",
     "ProgrammingError",
     "Time",
     "TimeFromTicks",
